@@ -113,6 +113,7 @@ void coreboot_platform_setup(void);
 void cbfs_payload_setup(void);
 void coreboot_preinit(void);
 void coreboot_cbfs_init(void);
+void coreboot_romfile_init(void);
 struct cb_header;
 void *find_cb_subtable(struct cb_header *cbh, u32 tag);
 struct cb_header *find_cb_table(void);

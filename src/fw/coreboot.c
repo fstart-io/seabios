@@ -480,6 +480,72 @@ coreboot_cbfs_init(void)
     process_links_file();
 }
 
+
+/****************************************************************
+ * Files handed over in RAM (fstart)
+ ****************************************************************/
+
+// fstart passes payload files in RAM, one record each, instead of CBFS.
+#define CB_TAG_FSTART_FILE 0x46530001
+
+struct cb_fstart_file {
+    u32 tag;
+    u32 size;
+    u64 address;
+    u32 file_size;
+    u32 reserved;
+    char name[0];
+} PACKED;
+
+struct mem_romfile_s {
+    struct romfile_s file;
+    void *data;
+};
+
+static int
+mem_copyfile(struct romfile_s *file, void *dst, u32 maxlen)
+{
+    struct mem_romfile_s *mfile = container_of(file, struct mem_romfile_s, file);
+    if (file->size > maxlen) {
+        warn_noalloc();
+        return -1;
+    }
+    memcpy(dst, mfile->data, file->size);
+    return file->size;
+}
+
+// Register the files listed in the coreboot table.
+void
+coreboot_romfile_init(void)
+{
+    if (!CONFIG_COREBOOT)
+        return;
+    struct cb_header *cbh = find_cb_table();
+    if (!cbh)
+        return;
+    char *tbl = (char *)cbh + sizeof(*cbh);
+    u32 i;
+    for (i = 0; i < cbh->table_entries; i++) {
+        struct cb_fstart_file *rec = (void*)tbl;
+        tbl += rec->size;
+        if (rec->tag != CB_TAG_FSTART_FILE)
+            continue;
+        struct mem_romfile_s *mfile = malloc_tmp(sizeof(*mfile));
+        if (!mfile) {
+            warn_noalloc();
+            return;
+        }
+        memset(mfile, 0, sizeof(*mfile));
+        strtcpy(mfile->file.name, rec->name, sizeof(mfile->file.name));
+        mfile->file.size = rec->file_size;
+        mfile->file.copy = mem_copyfile;
+        mfile->data = (void*)(u32)rec->address;
+        dprintf(1, "Found file %s (%d bytes at %p)\n"
+                , mfile->file.name, mfile->file.size, mfile->data);
+        romfile_add(&mfile->file);
+    }
+}
+
 struct cbfs_payload_segment {
     u32 type;
     u32 compression;
