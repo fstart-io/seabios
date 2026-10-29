@@ -48,18 +48,126 @@ struct {
     u8 *          log_area_last_entry;
 } tpm_state VARLOW;
 
+static int tpm20_get_hash_buffersize(u16 hashAlg);
+
+/* The log was started by earlier firmware and is continued; its format is
+ * crypto-agile (TPM 2.0) or SHA-1 (TPM 1.2). */
+static int tpm_log_continued, tpm_log_continued_agile;
+/* The banks of a continued crypto-agile log, from its Spec ID event. */
+static u16 tpm_log_continued_algs[8];
+static u32 tpm_log_continued_alg_count;
+
+/*
+ * Find the end of a TCG event log that earlier firmware started in the log
+ * area: SHA-1 format (TPM 1.2) or crypto-agile format behind a "Spec ID
+ * Event03" (TPM 2.0). The area is zero past the last entry, and no entry
+ * has PCR index 0 with event type 0 (EV_PREBOOT_CERT is reserved). Returns
+ * the number of entries; 0 for an empty or unparsable area.
+ */
+static u32 tpm_log_find_end(u8 *start, u32 size, u8 **next, u8 **last,
+                            int *agile)
+{
+    u8 *p = start, *end = start + size;
+    u16 algorithms[8];
+    u32 num_algs = 0, count = 0;
+
+    while (p + 32 <= end) {
+        struct tpm_log_header *hdr = (void *)p;
+        if (hdr->pcrindex == 0 && hdr->eventtype == 0)
+            break;
+        u8 *q;
+        if (count == 0 || !num_algs) {
+            /* TCG_PCClientPCREvent: 20-byte SHA-1 digest. */
+            u32 event_size = *(u32 *)(p + 28);
+            q = p + 32 + event_size;
+            if (q > end || q < p)
+                return 0;
+            struct TCG_EfiSpecIdEventStruct *spec = (void *)(p + 32);
+            if (count == 0 && hdr->eventtype == EV_NO_ACTION
+                && event_size >= sizeof(*spec)
+                && !memcmp(spec->signature, "Spec ID Event03", 16)) {
+                num_algs = spec->numberOfAlgorithms;
+                if (!num_algs || num_algs > ARRAY_SIZE(algorithms)
+                    || event_size < sizeof(*spec) + num_algs * 4)
+                    return 0;
+                u32 i;
+                for (i = 0; i < num_algs; i++) {
+                    algorithms[i] = spec->digestSizes[i].algorithmId;
+                    if (tpm20_get_hash_buffersize(algorithms[i])
+                        != spec->digestSizes[i].digestSize)
+                        return 0;
+                }
+            }
+        } else {
+            /* TCG_PCR_EVENT2: digest count, then (algorithm, digest). */
+            q = p + 12;
+            u32 n = *(u32 *)(p + 8), i, j;
+            if (n > num_algs)
+                return 0;
+            for (i = 0; i < n; i++) {
+                if (q + 2 > end)
+                    return 0;
+                u16 alg = *(u16 *)q;
+                int digest_size = tpm20_get_hash_buffersize(alg);
+                for (j = 0; j < num_algs; j++)
+                    if (alg == algorithms[j])
+                        break;
+                if (digest_size < 0 || j == num_algs)
+                    return 0;
+                q += 2 + digest_size;
+            }
+            if (q + 4 > end)
+                return 0;
+            q += 4 + *(u32 *)q;
+            if (q > end || q < p)
+                return 0;
+        }
+        *last = p;
+        p = q;
+        count++;
+    }
+    *next = p;
+    *agile = num_algs != 0;
+    memcpy(tpm_log_continued_algs, algorithms, num_algs * sizeof(algorithms[0]));
+    tpm_log_continued_alg_count = num_algs;
+    return count;
+}
+
 static int tpm_set_log_area(u8 *log_area_start_address,
                             u32 log_area_minimum_length)
 {
     if (!log_area_start_address || !log_area_minimum_length)
         return -1;
 
-    memset(log_area_start_address, 0, log_area_minimum_length);
     tpm_state.log_area_start_address = log_area_start_address;
     tpm_state.log_area_minimum_length = log_area_minimum_length;
     tpm_state.log_area_next_entry = log_area_start_address;
     tpm_state.log_area_last_entry = NULL;
     tpm_state.entry_count = 0;
+
+    if (CONFIG_COREBOOT) {
+        /* coreboot-style firmware measured itself into this log already. */
+        u8 *next, *last = NULL;
+        int agile = 0;
+        u32 count = tpm_log_find_end(log_area_start_address,
+                                     log_area_minimum_length, &next, &last,
+                                     &agile);
+        if (count) {
+            dprintf(DEBUG_tcg, "TCGBIOS: continuing the firmware's event log:"
+                    " %u entries, %u bytes\n", count,
+                    (u32)(next - log_area_start_address));
+            memset(next, 0, log_area_start_address + log_area_minimum_length
+                   - next);
+            tpm_state.log_area_next_entry = next;
+            tpm_state.log_area_last_entry = last;
+            tpm_state.entry_count = count;
+            tpm_log_continued = 1;
+            tpm_log_continued_agile = agile;
+            return 0;
+        }
+    }
+
+    memset(log_area_start_address, 0, log_area_minimum_length);
     return 0;
 }
 
@@ -68,6 +176,21 @@ tpm_tcpa_probe(void)
 {
     struct tcpa_descriptor_rev2 *tcpa = find_acpi_table(TCPA_SIGNATURE);
     if (!tcpa)
+        return -1;
+
+    if (tcpa->platform_class == TCPA_ACPI_CLASS_SERVER) {
+        struct tcpa_server_descriptor *server = (void *)tcpa;
+        if (server->length < sizeof(*server)
+            || server->log_area_minimum_length > 0xffffffff
+            || server->log_area_start_address > 0xffffffff)
+            return -1;
+        dprintf(DEBUG_tcg, "TCGBIOS: TCPA (server): LASA = %p, LAML = %u\n",
+                (u8 *)(long)server->log_area_start_address,
+                (u32)server->log_area_minimum_length);
+        return tpm_set_log_area((u8 *)(long)server->log_area_start_address,
+                                server->log_area_minimum_length);
+    }
+    if (tcpa->length < sizeof(*tcpa))
         return -1;
 
     dprintf(DEBUG_tcg, "TCGBIOS: TCPA: LASA = %p, LAML = %u\n",
@@ -285,6 +408,30 @@ tpm20_write_EfiSpecIdEventStruct(void)
 {
     if (!tpm20_pcr_selection)
         return -1;
+
+    /* The firmware's log starts with its own Spec ID event: the TPM's banks
+     * must be the ones it lists, or the events appended here would not
+     * parse. */
+    if (tpm_log_continued) {
+        struct tpms_pcr_selection *sel = tpm20_pcr_selection->selections;
+        void *end = (void*)tpm20_pcr_selection + tpm20_pcr_selection_size;
+        u32 i, j, active = 0;
+        for (i = 0; i < be32_to_cpu(tpm20_pcr_selection->count); i++) {
+            void *nsel = (void*)sel + sizeof(*sel) + sel->sizeOfSelect;
+            if (nsel > end)
+                return -1;
+            if (sel->sizeOfSelect && sel->pcrSelect[0]) {
+                for (j = 0; j < tpm_log_continued_alg_count; j++)
+                    if (tpm_log_continued_algs[j] == be16_to_cpu(sel->hashAlg))
+                        break;
+                if (j == tpm_log_continued_alg_count)
+                    return -1;
+                active++;
+            }
+            sel = nsel;
+        }
+        return active == tpm_log_continued_alg_count ? 0 : -1;
+    }
 
     struct {
         struct TCG_EfiSpecIdEventStruct hdr;
@@ -1219,6 +1366,16 @@ tpm_setup(void)
     TPM_version = tpmhw_probe();
     if (TPM_version == TPM_VERSION_NONE)
         return;
+
+    /* A continued log must be in the format of the TPM. Restarting it would
+     * leave the PCRs with measurements no log describes: disable the TPM. */
+    if (tpm_log_continued
+        && tpm_log_continued_agile != (TPM_version == TPM_VERSION_2)) {
+        dprintf(DEBUG_tcg, "TCGBIOS: firmware log format does not match"
+                " the TPM\n");
+        tpm_set_failure();
+        return;
+    }
 
     dprintf(DEBUG_tcg,
             "TCGBIOS: Detected a TPM %s.\n",

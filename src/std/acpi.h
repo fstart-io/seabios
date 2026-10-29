@@ -314,6 +314,16 @@ struct tcpa_descriptor_rev2
     u64  log_area_start_address;
 } PACKED;
 
+/* TCG ACPI 1.5 table 4: the server TCPA layout */
+struct tcpa_server_descriptor
+{
+    ACPI_TABLE_HEADER_DEF
+    u16  platform_class;
+    u16  reserved;
+    u64  log_area_minimum_length;
+    u64  log_area_start_address;
+} PACKED;
+
 /* TCPA ACPI definitions */
 #define TCPA_ACPI_CLASS_CLIENT          0
 #define TCPA_ACPI_CLASS_SERVER          1
